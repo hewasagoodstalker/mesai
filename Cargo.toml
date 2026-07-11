@@ -1,17 +1,21 @@
 [package]
 name = "mesai"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Basit çalışma takip uygulaması: sayaç, oturum kayıtları, ekler ve dışa aktarma"
+description = "Simple study tracker: timer, session log, file attachments, export"
 
 [dependencies]
-# eframe/egui: saf Rust GUI. winit üzerinden Wayland'ı doğrudan (native) konuşur,
-# WAYLAND_DISPLAY varsa Wayland'ı tercih eder, yoksa X11'e düşer.
+# eframe/egui: pure-Rust GUI. Talks Wayland natively through winit
+# (prefers Wayland when WAYLAND_DISPLAY is set, falls back to X11).
 eframe = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
+# Native file picker via the XDG desktop portal (works on Wayland,
+# where winit does not deliver drag-and-drop events).
+rfd = "0.15"
+pollster = "0.4"
 
 [profile.release]
 opt-level = 2
