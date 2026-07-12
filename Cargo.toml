@@ -1,6 +1,6 @@
 [package]
 name = "mesai"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Simple study tracker: timer, session log, file attachments, export"
 
@@ -16,6 +16,8 @@ dirs = "5"
 # where winit does not deliver drag-and-drop events).
 rfd = "0.15"
 pollster = "0.4"
+# Embedding attachment file contents in JSON backups
+base64 = "0.22"
 
 [profile.release]
 opt-level = 2

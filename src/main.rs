@@ -1,8 +1,36 @@
+// mesai — a simple study tracker
+//
+// What it does:
+//   * Timer: start when you sit down, pause if needed, save when you finish.
+//   * Session log: topic, notes, tags and file attachments (e.g. the .c files
+//     you wrote that day). Attached files are *copied*, so you keep that day's
+//     version even if the original changes later.
+//   * Attachments: native file picker ("Add files…", via the XDG desktop
+//     portal — works on Wayland), typing a path by hand, or drag & drop
+//     (drag & drop only works on X11: winit's Wayland backend does not
+//     deliver file-drop events).
+//   * Stats: total time, day streak, last 14 days, per-topic breakdown.
+//   * Export: CSV (for spreadsheets) and JSON (full backup; attachment files
+//     up to 5 MB are embedded, so the backup restores on a fresh machine).
+//   * Import: merge sessions back in from a JSON backup. Duplicates (same
+//     start & end time) are skipped; attachments are restored from the
+//     embedded bytes, or copied from the original path as a fallback.
+//   * Language: English by default, Turkish available from the top-right
+//     selector. The choice is persisted.
+//
+// Data lives under ~/.local/share/mesai/:
+//   data.json          -> all sessions + settings
+//   attachments/<id>/  -> copies of the files attached to each session
+//
+// UI is eframe/egui: winit talks Wayland natively (X11 as fallback).
+// The Wayland app_id of the window is "mesai".
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate, Utc};
 use eframe::egui;
 use egui::{Color32, RichText};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -100,6 +128,12 @@ struct Strings {
     export_json_info: &'static str,
     export_csv_btn: &'static str,
     export_json_btn: &'static str,
+    import_heading: &'static str,
+    import_info: &'static str,
+    import_btn: &'static str,
+    import_picker_title: &'static str,
+    invalid_backup: &'static str,
+    import_err: &'static str,
     last_export_label: &'static str,
     open_folder: &'static str,
     data_dir_label: &'static str,
@@ -130,7 +164,7 @@ static STR_EN: Strings = Strings {
     tab_timer: "Timer",
     tab_sessions: "Sessions",
     tab_stats: "Stats",
-    tab_export: "Export",
+    tab_export: "Data",
 
     running: "Running",
     paused: "Paused",
@@ -195,9 +229,15 @@ static STR_EN: Strings = Strings {
 
     export_heading: "Export",
     export_csv_info: "CSV: a summary table for spreadsheet apps (LibreOffice Calc etc.).",
-    export_json_info: "JSON: a full backup of all data, attachment paths included.",
+    export_json_info: "JSON: a full backup — attachment files up to 5 MB are embedded, so it restores even on a fresh machine.",
     export_csv_btn: "Export CSV",
     export_json_btn: "Export JSON",
+    import_heading: "Import",
+    import_info: "Restore sessions from a JSON backup. Existing sessions are kept; duplicates (same start & end time) are skipped.",
+    import_btn: "Import JSON backup…",
+    import_picker_title: "Choose a backup file",
+    invalid_backup: "This file is not a valid Mesai backup.",
+    import_err: "Import failed:",
     last_export_label: "Last export:",
     open_folder: "Open folder",
     data_dir_label: "Data folder:",
@@ -228,7 +268,7 @@ static STR_TR: Strings = Strings {
     tab_timer: "Sayaç",
     tab_sessions: "Kayıtlar",
     tab_stats: "İstatistik",
-    tab_export: "Dışa Aktar",
+    tab_export: "Veri",
 
     running: "Çalışıyor",
     paused: "Duraklatıldı",
@@ -293,9 +333,15 @@ static STR_TR: Strings = Strings {
 
     export_heading: "Dışa aktar",
     export_csv_info: "CSV: tablo programlarında (LibreOffice Calc vb.) açmak için özet tablo.",
-    export_json_info: "JSON: tüm verinin tam yedeği; ek dosyaların yolları da içinde.",
+    export_json_info: "JSON: tam yedek — 5 MB'a kadar ek dosyaları içine gömülür, temiz kurulumda bile geri yüklenir.",
     export_csv_btn: "CSV olarak dışa aktar",
     export_json_btn: "JSON olarak dışa aktar",
+    import_heading: "İçe aktar",
+    import_info: "JSON yedeğinden oturumları geri yükle. Mevcut kayıtlar korunur; kopyalar (aynı başlangıç ve bitiş) atlanır.",
+    import_btn: "JSON yedeğini içe aktar…",
+    import_picker_title: "Yedek dosyasını seç",
+    invalid_backup: "Bu dosya geçerli bir Mesai yedeği değil.",
+    import_err: "İçe aktarma hatası:",
     last_export_label: "Son dışa aktarma:",
     open_folder: "Klasörü aç",
     data_dir_label: "Veri klasörü:",
@@ -327,7 +373,7 @@ const MONTHS_EN: [&str; 12] = [
 ];
 const MONTHS_TR: [&str; 12] = [
     "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
-"Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık",
+    "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık",
 ];
 const DAYS_EN: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const DAYS_TR: [&str; 7] = ["Pzt", "Sal", "Çar", "Per", "Cum", "Cts", "Paz"];
@@ -411,6 +457,27 @@ impl Lang {
         }
     }
 
+    fn import_result(self, added: usize, skipped: usize, missing: usize) -> String {
+        let mut msg = match self {
+            Lang::En => format!("Imported {added} session(s), skipped {skipped} duplicate(s)."),
+            Lang::Tr => format!("{added} oturum içe aktarıldı, {skipped} kopya atlandı."),
+        };
+        if missing > 0 {
+            msg.push_str(&match self {
+                Lang::En => format!(" {missing} attachment file(s) could not be restored."),
+                Lang::Tr => format!(" {missing} ek dosyası geri yüklenemedi."),
+            });
+        }
+        msg
+    }
+
+    fn large_note(self, n: usize) -> String {
+        match self {
+            Lang::En => format!(" ({n} file(s) over 5 MB kept as a path reference only)"),
+            Lang::Tr => format!(" ({n} dosya 5 MB'tan büyük olduğu için yalnızca yol olarak eklendi)"),
+        }
+    }
+
     fn streak_line(self, n: u32) -> String {
         format!("{} {}", n, self.s().streak_suffix)
     }
@@ -424,6 +491,10 @@ impl Lang {
 struct Attachment {
     file_name: String,
     path: PathBuf, // path of the copy under attachments/<id>/
+    /// Base64 file contents. Only set inside JSON backups (for files ≤ 5 MB),
+    /// never in the live data.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -439,7 +510,7 @@ struct Session {
     attachments: Vec<Attachment>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct Database {
     next_id: u64,
     /// UI language; defaults to English for files written by older versions.
@@ -466,9 +537,9 @@ fn app_paths() -> Paths {
 
 fn load_db(paths: &Paths) -> Database {
     fs::read_to_string(&paths.db_file)
-    .ok()
-    .and_then(|s| serde_json::from_str(&s).ok())
-    .unwrap_or_default()
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Write to a temp file first, then rename: if writing is interrupted the
@@ -481,36 +552,62 @@ fn save_db(paths: &Paths, db: &Database) -> std::io::Result<()> {
     fs::rename(&tmp, &paths.db_file)
 }
 
-/// Copy the source file under attachments/<id>/. If a file with the same
-/// name exists, append _1, _2, ...
-fn copy_attachment(attach_dir: &Path, id: u64, src: &Path) -> std::io::Result<Attachment> {
+/// Pick a destination path under attachments/<id>/, appending _1, _2, ...
+/// if a file with the same name already exists.
+fn unique_dest(attach_dir: &Path, id: u64, name: &str) -> std::io::Result<PathBuf> {
     let dir = attach_dir.join(id.to_string());
     fs::create_dir_all(&dir)?;
 
-    let name = src
-    .file_name()
-    .map(|s| s.to_string_lossy().into_owned())
-    .unwrap_or_else(|| "attachment".to_string());
-
-    let mut dest = dir.join(&name);
+    let mut dest = dir.join(name);
     let mut n = 1;
     while dest.exists() {
-        let stem = Path::new(&name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("attachment");
-        let new_name = match Path::new(&name).extension().and_then(|s| s.to_str()) {
+        let stem = Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("attachment");
+        let new_name = match Path::new(name).extension().and_then(|s| s.to_str()) {
             Some(ext) => format!("{stem}_{n}.{ext}"),
             None => format!("{stem}_{n}"),
         };
         dest = dir.join(new_name);
         n += 1;
     }
+    Ok(dest)
+}
 
+/// Copy the source file under attachments/<id>/.
+fn copy_attachment(attach_dir: &Path, id: u64, src: &Path) -> std::io::Result<Attachment> {
+    let name = src
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "attachment".to_string());
+    let dest = unique_dest(attach_dir, id, &name)?;
     fs::copy(src, &dest)?;
     Ok(Attachment {
         file_name: dest.file_name().unwrap().to_string_lossy().into_owned(),
-       path: dest,
+        path: dest,
+        data: None,
+    })
+}
+
+/// Write raw bytes (restored from a backup) under attachments/<id>/.
+/// Any directory components in the stored name are stripped for safety.
+fn write_attachment_bytes(
+    attach_dir: &Path,
+    id: u64,
+    name: &str,
+    bytes: &[u8],
+) -> std::io::Result<Attachment> {
+    let safe = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment");
+    let dest = unique_dest(attach_dir, id, safe)?;
+    fs::write(&dest, bytes)?;
+    Ok(Attachment {
+        file_name: dest.file_name().unwrap().to_string_lossy().into_owned(),
+        path: dest,
+        data: None,
     })
 }
 
@@ -525,10 +622,10 @@ fn fmt_hms(total: i64) -> String {
 
 fn parse_tags(s: &str) -> Vec<String> {
     s.split(',')
-    .map(|t| t.trim())
-    .filter(|t| !t.is_empty())
-    .map(|t| t.to_string())
-    .collect()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
@@ -562,10 +659,10 @@ fn add_manual_path(list: &mut Vec<PathBuf>, input: &mut String, lang: Lang) -> S
 /// Open a file or folder with the system default application.
 fn open_in_system(p: &Path) {
     let _ = Command::new("xdg-open")
-    .arg(p)
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn();
+        .arg(p)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn csv_field(s: &str) -> String {
@@ -579,29 +676,117 @@ fn csv_field(s: &str) -> String {
 fn export_csv(db: &Database, dir: &Path) -> std::io::Result<PathBuf> {
     let path = dir.join(format!("mesai_{}.csv", Local::now().format("%Y%m%d_%H%M%S")));
     let mut out =
-    String::from("id,started,ended,duration_seconds,duration,topic,tags,notes,attachments\n");
+        String::from("id,started,ended,duration_seconds,duration,topic,tags,notes,attachments\n");
     for s in &db.sessions {
         out.push_str(&format!(
             "{},{},{},{},{},{},{},{},{}\n",
             s.id,
             s.started_at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
-                              s.ended_at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
-                              s.duration_secs,
-                              csv_field(&db.lang.dur_human(s.duration_secs as i64)),
-                              csv_field(&s.topic),
-                              csv_field(&s.tags.join(", ")),
-                              csv_field(&s.notes),
-                              s.attachments.len(),
+            s.ended_at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+            s.duration_secs,
+            csv_field(&db.lang.dur_human(s.duration_secs as i64)),
+            csv_field(&s.topic),
+            csv_field(&s.tags.join(", ")),
+            csv_field(&s.notes),
+            s.attachments.len(),
         ));
     }
     fs::write(&path, out)?;
     Ok(path)
 }
 
-fn export_json(db: &Database, dir: &Path) -> std::io::Result<PathBuf> {
+/// Attachment files up to this size get embedded (base64) in JSON backups.
+const EMBED_LIMIT_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Full backup: clones the database and embeds the bytes of each attachment
+/// (≤ 5 MB), so the file restores even on a fresh machine. Returns the path
+/// and how many files were too large to embed.
+fn export_json(db: &Database, dir: &Path) -> std::io::Result<(PathBuf, usize)> {
+    let mut backup = db.clone();
+    let mut too_large = 0usize;
+    for sess in &mut backup.sessions {
+        for a in &mut sess.attachments {
+            match fs::metadata(&a.path) {
+                Ok(m) if m.len() <= EMBED_LIMIT_BYTES => {
+                    if let Ok(bytes) = fs::read(&a.path) {
+                        a.data = Some(B64.encode(bytes));
+                    }
+                }
+                Ok(_) => too_large += 1,
+                Err(_) => {} // file missing: keep the path for reference
+            }
+        }
+    }
     let path = dir.join(format!("mesai_{}.json", Local::now().format("%Y%m%d_%H%M%S")));
-    fs::write(&path, serde_json::to_string_pretty(db).unwrap())?;
-    Ok(path)
+    fs::write(&path, serde_json::to_string_pretty(&backup).unwrap())?;
+    Ok((path, too_large))
+}
+
+/// Merge sessions from `backup` into `db`. Sessions whose (start, end) pair
+/// already exists are skipped; the rest get fresh IDs so they can never
+/// collide with existing ones. Attachments are restored from the embedded
+/// bytes when present, otherwise copied from the recorded path if that file
+/// still exists. Returns (added, skipped_duplicates, missing_attachments).
+fn merge_backup(db: &mut Database, attach_dir: &Path, backup: Database) -> (usize, usize, usize) {
+    let existing: HashSet<(i64, i64)> = db
+        .sessions
+        .iter()
+        .map(|x| (x.started_at.timestamp_micros(), x.ended_at.timestamp_micros()))
+        .collect();
+
+    let (mut added, mut skipped, mut missing) = (0usize, 0usize, 0usize);
+    for sess in backup.sessions {
+        let key = (
+            sess.started_at.timestamp_micros(),
+            sess.ended_at.timestamp_micros(),
+        );
+        if existing.contains(&key) {
+            skipped += 1;
+            continue;
+        }
+
+        let id = db.next_id.max(1);
+        db.next_id = id + 1;
+
+        let mut attachments = Vec::new();
+        for a in &sess.attachments {
+            if let Some(b64) = &a.data {
+                // Preferred path: restore from the embedded bytes.
+                if let Ok(bytes) = B64.decode(b64) {
+                    if let Ok(at) = write_attachment_bytes(attach_dir, id, &a.file_name, &bytes) {
+                        attachments.push(at);
+                        continue;
+                    }
+                }
+                missing += 1;
+            } else if a.path.is_file() {
+                // Old-style backup (paths only): copy if the file exists.
+                match copy_attachment(attach_dir, id, &a.path) {
+                    Ok(at) => attachments.push(at),
+                    Err(_) => missing += 1,
+                }
+            } else {
+                missing += 1;
+            }
+        }
+
+        db.sessions.push(Session {
+            id,
+            started_at: sess.started_at,
+            ended_at: sess.ended_at,
+            duration_secs: sess.duration_secs,
+            topic: sess.topic,
+            notes: sess.notes,
+            tags: sess.tags,
+            attachments,
+        });
+        added += 1;
+    }
+
+    if added > 0 {
+        db.sessions.sort_by_key(|x| x.started_at);
+    }
+    (added, skipped, missing)
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +858,12 @@ enum Tab {
     Export,
 }
 
+/// Result of a native file-picker dialog, tagged with what it was opened for.
+enum Picked {
+    Attachments(Vec<PathBuf>),
+    ImportFile(Option<PathBuf>),
+}
+
 struct MesaiApp {
     paths: Paths,
     db: Database,
@@ -689,9 +880,9 @@ struct MesaiApp {
     last_export: Option<PathBuf>,
 
     // Native file picker (runs on its own thread so the UI never blocks;
-    // picked paths come back through this channel).
-    picker_tx: Sender<Vec<PathBuf>>,
-    picker_rx: Receiver<Vec<PathBuf>>,
+    // results come back through this channel).
+    picker_tx: Sender<Picked>,
+    picker_rx: Receiver<Picked>,
     picker_busy: bool,
 }
 
@@ -727,7 +918,7 @@ impl MesaiApp {
 
     /// Open the native file picker on a background thread. On Wayland this
     /// goes through the XDG desktop portal, i.e. your desktop's own dialog.
-    fn open_file_picker(&mut self, ctx: egui::Context) {
+    fn open_attachment_picker(&mut self, ctx: egui::Context) {
         if self.picker_busy {
             return;
         }
@@ -739,10 +930,30 @@ impl MesaiApp {
                 rfd::AsyncFileDialog::new().set_title(title).pick_files(),
             );
             let paths: Vec<PathBuf> = files
-            .map(|fs| fs.iter().map(|f| f.path().to_path_buf()).collect())
-            .unwrap_or_default();
-            let _ = tx.send(paths);
+                .map(|fs| fs.iter().map(|f| f.path().to_path_buf()).collect())
+                .unwrap_or_default();
+            let _ = tx.send(Picked::Attachments(paths));
             ctx.request_repaint(); // wake the UI so the new files show up immediately
+        });
+    }
+
+    /// Same, but for choosing a single JSON backup file to import.
+    fn open_import_picker(&mut self, ctx: egui::Context) {
+        if self.picker_busy {
+            return;
+        }
+        self.picker_busy = true;
+        let tx = self.picker_tx.clone();
+        let title = self.db.lang.s().import_picker_title;
+        std::thread::spawn(move || {
+            let file = pollster::block_on(
+                rfd::AsyncFileDialog::new()
+                    .set_title(title)
+                    .add_filter("JSON", &["json"])
+                    .pick_file(),
+            );
+            let _ = tx.send(Picked::ImportFile(file.map(|f| f.path().to_path_buf())));
+            ctx.request_repaint();
         });
     }
 
@@ -760,6 +971,37 @@ impl MesaiApp {
         } else {
             self.status = lang.s().start_first.to_string();
         }
+    }
+
+    /// Merge sessions from a JSON backup into the database. Sessions whose
+    /// (start, end) pair already exists are skipped. Attachments are restored
+    /// from the embedded bytes when present, otherwise copied from the
+    /// recorded path if that file still exists.
+    fn import_backup(&mut self, path: &Path) {
+        let lang = self.db.lang;
+        let s = lang.s();
+
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("{} {e}", s.import_err);
+                return;
+            }
+        };
+        let backup: Database = match serde_json::from_str(&text) {
+            Ok(b) => b,
+            Err(_) => {
+                self.status = s.invalid_backup.to_string();
+                return;
+            }
+        };
+
+        let (added, skipped, missing) =
+            merge_backup(&mut self.db, &self.paths.attach_dir, backup);
+        if added > 0 {
+            self.save();
+        }
+        self.status = lang.import_result(added, skipped, missing);
     }
 
     /// Turn the draft into a permanent session: copy attachments, write the DB.
@@ -783,9 +1025,9 @@ impl MesaiApp {
             ended_at: d.ended_at,
             duration_secs: d.duration_secs,
             topic: d.topic.trim().to_string(),
-                              notes: d.notes.trim().to_string(),
-                              tags: parse_tags(&d.tags),
-                              attachments,
+            notes: d.notes.trim().to_string(),
+            tags: parse_tags(&d.tags),
+            attachments,
         });
         self.db.sessions.sort_by_key(|s| s.started_at);
         self.save();
@@ -829,7 +1071,7 @@ impl MesaiApp {
                     ui.label(RichText::new("00:00:00").monospace().size(56.0).weak());
                     ui.add_space(16.0);
                     let btn = egui::Button::new(RichText::new(s.start).size(18.0))
-                    .min_size(egui::vec2(180.0, 44.0));
+                        .min_size(egui::vec2(180.0, 44.0));
                     if ui.add(btn).clicked() {
                         act = Act::Start;
                     }
@@ -902,10 +1144,10 @@ impl MesaiApp {
                     if ui
                         .add_enabled(!self.picker_busy, egui::Button::new(s.add_files))
                         .clicked()
-                        {
-                            want_picker = true;
-                        }
-                        let edit = egui::TextEdit::singleline(&mut self.manual_path)
+                    {
+                        want_picker = true;
+                    }
+                    let edit = egui::TextEdit::singleline(&mut self.manual_path)
                         .hint_text(s.path_hint)
                         .desired_width(320.0);
                     ui.add(edit);
@@ -922,7 +1164,7 @@ impl MesaiApp {
 
         if want_picker {
             let ctx = ui.ctx().clone();
-            self.open_file_picker(ctx);
+            self.open_attachment_picker(ctx);
         }
 
         match act {
@@ -950,12 +1192,12 @@ impl MesaiApp {
                     self.draft = Some(Draft {
                         started_at: t.started_at,
                         ended_at: Utc::now(),
-                                      duration_secs: t.elapsed_secs().max(0) as u64,
-                                      topic: String::new(),
-                                      notes: String::new(),
-                                      tags: String::new(),
-                                      attachments: std::mem::take(&mut self.pending_attachments),
-                                      discard_armed: false,
+                        duration_secs: t.elapsed_secs().max(0) as u64,
+                        topic: String::new(),
+                        notes: String::new(),
+                        tags: String::new(),
+                        attachments: std::mem::take(&mut self.pending_attachments),
+                        discard_armed: false,
                     });
                     self.cancel_armed = false;
                     self.status = s.finish_fill.to_string();
@@ -986,43 +1228,43 @@ impl MesaiApp {
             ui.add_space(8.0);
 
             egui::Grid::new("draft_grid")
-            .num_columns(2)
-            .spacing([16.0, 6.0])
-            .show(ui, |ui| {
-                ui.label(s.duration_label);
-                ui.label(RichText::new(lang.dur_human(d.duration_secs as i64)).strong());
-                ui.end_row();
-                ui.label(s.started_label);
-                ui.label(lang.dt(&d.started_at));
-                ui.end_row();
-                ui.label(s.ended_label);
-                ui.label(lang.dt(&d.ended_at));
-                ui.end_row();
-            });
+                .num_columns(2)
+                .spacing([16.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label(s.duration_label);
+                    ui.label(RichText::new(lang.dur_human(d.duration_secs as i64)).strong());
+                    ui.end_row();
+                    ui.label(s.started_label);
+                    ui.label(lang.dt(&d.started_at));
+                    ui.end_row();
+                    ui.label(s.ended_label);
+                    ui.label(lang.dt(&d.ended_at));
+                    ui.end_row();
+                });
 
             ui.add_space(10.0);
             ui.label(s.topic_label);
             ui.add(
                 egui::TextEdit::singleline(&mut d.topic)
-                .hint_text(s.topic_hint)
-                .desired_width(f32::INFINITY),
+                    .hint_text(s.topic_hint)
+                    .desired_width(f32::INFINITY),
             );
 
             ui.add_space(6.0);
             ui.label(s.notes_label);
             ui.add(
                 egui::TextEdit::multiline(&mut d.notes)
-                .hint_text(s.notes_hint)
-                .desired_rows(5)
-                .desired_width(f32::INFINITY),
+                    .hint_text(s.notes_hint)
+                    .desired_rows(5)
+                    .desired_width(f32::INFINITY),
             );
 
             ui.add_space(6.0);
             ui.label(s.tags_label);
             ui.add(
                 egui::TextEdit::singleline(&mut d.tags)
-                .hint_text(s.tags_hint)
-                .desired_width(f32::INFINITY),
+                    .hint_text(s.tags_hint)
+                    .desired_width(f32::INFINITY),
             );
 
             ui.add_space(10.0);
@@ -1047,10 +1289,10 @@ impl MesaiApp {
                 if ui
                     .add_enabled(!self.picker_busy, egui::Button::new(s.add_files))
                     .clicked()
-                    {
-                        want_picker = true;
-                    }
-                    let edit = egui::TextEdit::singleline(&mut self.manual_path)
+                {
+                    want_picker = true;
+                }
+                let edit = egui::TextEdit::singleline(&mut self.manual_path)
                     .hint_text(s.path_hint)
                     .desired_width(320.0);
                 ui.add(edit);
@@ -1062,7 +1304,7 @@ impl MesaiApp {
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 let save_btn = egui::Button::new(RichText::new(s.save).size(16.0))
-                .min_size(egui::vec2(140.0, 36.0));
+                    .min_size(egui::vec2(140.0, 36.0));
                 if ui.add(save_btn).clicked() {
                     do_save = true;
                 }
@@ -1083,7 +1325,7 @@ impl MesaiApp {
 
         if want_picker {
             let ctx = ui.ctx().clone();
-            self.open_file_picker(ctx);
+            self.open_attachment_picker(ctx);
         }
 
         if do_save {
@@ -1122,81 +1364,81 @@ impl MesaiApp {
         let mut open_req: Option<PathBuf> = None;
 
         egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for sess in self.db.sessions.iter().rev() {
-                let topic = if sess.topic.is_empty() {
-                    s.no_topic
-                } else {
-                    sess.topic.as_str()
-                };
-                let title = format!(
-                    "{}  •  {}  •  {}",
-                    lang.dt(&sess.started_at),
-                                    lang.dur_human(sess.duration_secs as i64),
-                                    topic
-                );
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for sess in self.db.sessions.iter().rev() {
+                    let topic = if sess.topic.is_empty() {
+                        s.no_topic
+                    } else {
+                        sess.topic.as_str()
+                    };
+                    let title = format!(
+                        "{}  •  {}  •  {}",
+                        lang.dt(&sess.started_at),
+                        lang.dur_human(sess.duration_secs as i64),
+                        topic
+                    );
 
-                egui::CollapsingHeader::new(title)
-                .id_salt(sess.id)
-                .show(ui, |ui| {
-                    egui::Grid::new(("session_grid", sess.id))
-                    .num_columns(2)
-                    .spacing([16.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label(s.ended_label);
-                        ui.label(lang.dt(&sess.ended_at));
-                        ui.end_row();
-                        if !sess.tags.is_empty() {
-                            ui.label(s.tags_colon);
-                            ui.label(sess.tags.join(", "));
-                            ui.end_row();
-                        }
-                    });
+                    egui::CollapsingHeader::new(title)
+                        .id_salt(sess.id)
+                        .show(ui, |ui| {
+                            egui::Grid::new(("session_grid", sess.id))
+                                .num_columns(2)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label(s.ended_label);
+                                    ui.label(lang.dt(&sess.ended_at));
+                                    ui.end_row();
+                                    if !sess.tags.is_empty() {
+                                        ui.label(s.tags_colon);
+                                        ui.label(sess.tags.join(", "));
+                                        ui.end_row();
+                                    }
+                                });
 
-                    if !sess.notes.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(s.notes_colon).strong());
-                        ui.label(&sess.notes);
-                    }
+                            if !sess.notes.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(s.notes_colon).strong());
+                                ui.label(&sess.notes);
+                            }
 
-                    if !sess.attachments.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(s.attachments_colon).strong());
-                        for a in &sess.attachments {
+                            if !sess.attachments.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(s.attachments_colon).strong());
+                                for a in &sess.attachments {
+                                    ui.horizontal(|ui| {
+                                        ui.label(&a.file_name);
+                                        if ui.small_button(s.open).clicked() {
+                                            open_req = Some(a.path.clone());
+                                        }
+                                    });
+                                }
+                                if ui.small_button(s.open_attach_dir).clicked() {
+                                    open_req =
+                                        Some(self.paths.attach_dir.join(sess.id.to_string()));
+                                }
+                            }
+
+                            ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                ui.label(&a.file_name);
-                                if ui.small_button(s.open).clicked() {
-                                    open_req = Some(a.path.clone());
+                                if current_confirm == Some(sess.id) {
+                                    ui.colored_label(
+                                        Color32::from_rgb(230, 110, 110),
+                                        s.delete_q,
+                                    );
+                                    if ui.button(s.yes_delete).clicked() {
+                                        delete_id = Some(sess.id);
+                                    }
+                                    if ui.button(s.no_keep).clicked() {
+                                        clear_confirm = true;
+                                    }
+                                } else if ui.button(s.delete).clicked() {
+                                    set_confirm = Some(sess.id);
                                 }
                             });
-                        }
-                        if ui.small_button(s.open_attach_dir).clicked() {
-                            open_req =
-                            Some(self.paths.attach_dir.join(sess.id.to_string()));
-                        }
-                    }
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if current_confirm == Some(sess.id) {
-                            ui.colored_label(
-                                Color32::from_rgb(230, 110, 110),
-                                             s.delete_q,
-                            );
-                            if ui.button(s.yes_delete).clicked() {
-                                delete_id = Some(sess.id);
-                            }
-                            if ui.button(s.no_keep).clicked() {
-                                clear_confirm = true;
-                            }
-                        } else if ui.button(s.delete).clicked() {
-                            set_confirm = Some(sess.id);
-                        }
-                    });
-                });
-            }
-        });
+                        });
+                }
+            });
 
         if let Some(p) = open_req {
             open_in_system(&p);
@@ -1265,25 +1507,25 @@ impl MesaiApp {
 
         ui.add_space(8.0);
         egui::Grid::new("stats_grid")
-        .num_columns(2)
-        .spacing([24.0, 6.0])
-        .show(ui, |ui| {
-            ui.label(s.total_time);
-            ui.label(RichText::new(lang.dur_human(total)).strong());
-            ui.end_row();
-            ui.label(s.session_count);
-            ui.label(RichText::new(count.to_string()).strong());
-            ui.end_row();
-            ui.label(s.avg_session);
-            ui.label(RichText::new(lang.dur_human(total / count.max(1))).strong());
-            ui.end_row();
-            ui.label(s.streak_label);
-            ui.label(RichText::new(lang.streak_line(streak)).strong());
-            ui.end_row();
-            ui.label(s.active_days);
-            ui.label(RichText::new(format!("{}", by_day.len())).strong());
-            ui.end_row();
-        });
+            .num_columns(2)
+            .spacing([24.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(s.total_time);
+                ui.label(RichText::new(lang.dur_human(total)).strong());
+                ui.end_row();
+                ui.label(s.session_count);
+                ui.label(RichText::new(count.to_string()).strong());
+                ui.end_row();
+                ui.label(s.avg_session);
+                ui.label(RichText::new(lang.dur_human(total / count.max(1))).strong());
+                ui.end_row();
+                ui.label(s.streak_label);
+                ui.label(RichText::new(lang.streak_line(streak)).strong());
+                ui.end_row();
+                ui.label(s.active_days);
+                ui.label(RichText::new(format!("{}", by_day.len())).strong());
+                ui.end_row();
+            });
 
         ui.add_space(12.0);
         ui.separator();
@@ -1298,23 +1540,23 @@ impl MesaiApp {
         let max_day = last14.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
 
         egui::Grid::new("days_grid")
-        .num_columns(3)
-        .spacing([12.0, 4.0])
-        .show(ui, |ui| {
-            for (d, secs) in &last14 {
-                ui.label(lang.date_short(*d));
-                ui.add(
-                    egui::ProgressBar::new(*secs as f32 / max_day as f32)
-                    .desired_width(320.0),
-                );
-                if *secs > 0 {
-                    ui.label(lang.dur_human(*secs));
-                } else {
-                    ui.label("—");
+            .num_columns(3)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                for (d, secs) in &last14 {
+                    ui.label(lang.date_short(*d));
+                    ui.add(
+                        egui::ProgressBar::new(*secs as f32 / max_day as f32)
+                            .desired_width(320.0),
+                    );
+                    if *secs > 0 {
+                        ui.label(lang.dur_human(*secs));
+                    } else {
+                        ui.label("—");
+                    }
+                    ui.end_row();
                 }
-                ui.end_row();
-            }
-        });
+            });
 
         ui.add_space(12.0);
         ui.separator();
@@ -1325,19 +1567,19 @@ impl MesaiApp {
         topics.sort_by(|a, b| b.1.cmp(&a.1));
 
         egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Grid::new("topics_grid")
-            .num_columns(2)
-            .spacing([24.0, 4.0])
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (topic, secs) in topics.iter().take(15) {
-                    ui.label(topic);
-                    ui.label(lang.dur_human(*secs));
-                    ui.end_row();
-                }
+                egui::Grid::new("topics_grid")
+                    .num_columns(2)
+                    .spacing([24.0, 4.0])
+                    .show(ui, |ui| {
+                        for (topic, secs) in topics.iter().take(15) {
+                            ui.label(topic);
+                            ui.label(lang.dur_human(*secs));
+                            ui.end_row();
+                        }
+                    });
             });
-        });
     }
 
     fn ui_export(&mut self, ui: &mut egui::Ui) {
@@ -1352,9 +1594,9 @@ impl MesaiApp {
         ui.add_space(10.0);
 
         let export_dir = dirs::document_dir()
-        .filter(|p| p.exists())
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
+            .filter(|p| p.exists())
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
 
         ui.horizontal(|ui| {
             if ui.button(s.export_csv_btn).clicked() {
@@ -1368,8 +1610,12 @@ impl MesaiApp {
             }
             if ui.button(s.export_json_btn).clicked() {
                 match export_json(&self.db, &export_dir) {
-                    Ok(p) => {
-                        self.status = format!("{} {}", s.json_written, p.display());
+                    Ok((p, too_large)) => {
+                        let mut msg = format!("{} {}", s.json_written, p.display());
+                        if too_large > 0 {
+                            msg.push_str(&lang.large_note(too_large));
+                        }
+                        self.status = msg;
                         self.last_export = Some(p);
                     }
                     Err(e) => self.status = format!("{} {e}", s.export_err),
@@ -1389,6 +1635,20 @@ impl MesaiApp {
 
         ui.add_space(16.0);
         ui.separator();
+        ui.heading(s.import_heading);
+        ui.add_space(6.0);
+        ui.label(s.import_info);
+        ui.add_space(10.0);
+        if ui
+            .add_enabled(!self.picker_busy, egui::Button::new(s.import_btn))
+            .clicked()
+        {
+            let ctx = ui.ctx().clone();
+            self.open_import_picker(ctx);
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
         ui.horizontal(|ui| {
             ui.label(format!("{} {}", s.data_dir_label, self.paths.data_dir.display()));
             if ui.small_button(s.open).clicked() {
@@ -1403,10 +1663,16 @@ impl MesaiApp {
 impl eframe::App for MesaiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Results coming back from the native file picker
-        while let Ok(paths) = self.picker_rx.try_recv() {
+        while let Ok(msg) = self.picker_rx.try_recv() {
             self.picker_busy = false;
-            if !paths.is_empty() {
-                self.route_new_attachments(paths);
+            match msg {
+                Picked::Attachments(paths) => {
+                    if !paths.is_empty() {
+                        self.route_new_attachments(paths);
+                    }
+                }
+                Picked::ImportFile(Some(p)) => self.import_backup(&p),
+                Picked::ImportFile(None) => {} // dialog cancelled
             }
         }
 
@@ -1414,10 +1680,10 @@ impl eframe::App for MesaiApp {
         // Wayland backend has no drag-and-drop support — use "Add files…")
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
-            .dropped_files
-            .iter()
-            .filter_map(|f| f.path.clone())
-            .collect()
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
         });
         if !dropped.is_empty() {
             self.route_new_attachments(dropped);
@@ -1445,15 +1711,15 @@ impl eframe::App for MesaiApp {
                     // Language selector (persisted in data.json)
                     let mut lang_sel = self.db.lang;
                     egui::ComboBox::from_id_salt("lang_select")
-                    .selected_text(match lang_sel {
-                        Lang::En => "EN",
-                        Lang::Tr => "TR",
-                    })
-                    .width(64.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut lang_sel, Lang::En, "English");
-                        ui.selectable_value(&mut lang_sel, Lang::Tr, "Türkçe");
-                    });
+                        .selected_text(match lang_sel {
+                            Lang::En => "EN",
+                            Lang::Tr => "TR",
+                        })
+                        .width(64.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut lang_sel, Lang::En, "English");
+                            ui.selectable_value(&mut lang_sel, Lang::Tr, "Türkçe");
+                        });
                     if lang_sel != self.db.lang {
                         self.db.lang = lang_sel;
                         self.status = self.db.lang.s().ready.to_string();
@@ -1481,18 +1747,18 @@ impl eframe::App for MesaiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Timer => self.ui_timer(ui),
-                                           Tab::Sessions => self.ui_sessions(ui),
-                                           Tab::Stats => self.ui_stats(ui),
-                                           Tab::Export => self.ui_export(ui),
+            Tab::Sessions => self.ui_sessions(ui),
+            Tab::Stats => self.ui_stats(ui),
+            Tab::Export => self.ui_export(ui),
         });
     }
 }
 
 fn main() -> Result<(), eframe::Error> {
     let viewport = egui::ViewportBuilder::default()
-    .with_app_id(APP_ID) // Wayland app_id: shows up as "mesai" in window rules
-    .with_inner_size([960.0, 660.0])
-    .with_min_inner_size([720.0, 480.0]);
+        .with_app_id(APP_ID) // Wayland app_id: shows up as "mesai" in window rules
+        .with_inner_size([960.0, 660.0])
+        .with_min_inner_size([720.0, 480.0]);
 
     let options = eframe::NativeOptions {
         viewport,
@@ -1504,4 +1770,166 @@ fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(|cc| Ok(Box::new(MesaiApp::new(cc)))),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Tests: `cargo test` — these cover the backup/restore pipeline, which is
+// the part where a bug would mean losing data.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fresh scratch directory per test.
+    fn test_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mesai_test_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Deterministic timestamps so duplicate detection is predictable.
+    fn ts(offset: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + offset, 0).unwrap()
+    }
+
+    fn sample_session(n: i64) -> Session {
+        Session {
+            id: n as u64,
+            started_at: ts(n * 100),
+            ended_at: ts(n * 100 + 50),
+            duration_secs: 50,
+            topic: format!("topic {n}"),
+            notes: String::new(),
+            tags: vec!["test".into()],
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn backup_round_trip_restores_attachments() {
+        let dir = test_dir("roundtrip");
+
+        // Source database with one attachment file on disk
+        let src_file = dir.join("main.c");
+        fs::write(&src_file, b"int main(void) { return 0; }\n").unwrap();
+        let mut sess = sample_session(1);
+        sess.attachments.push(Attachment {
+            file_name: "main.c".into(),
+            path: src_file.clone(),
+            data: None,
+        });
+        let db1 = Database {
+            next_id: 2,
+            lang: Lang::En,
+            sessions: vec![sess],
+        };
+
+        // Export: the file's bytes must be embedded
+        let (backup_path, too_large) = export_json(&db1, &dir).unwrap();
+        assert_eq!(too_large, 0);
+        let text = fs::read_to_string(&backup_path).unwrap();
+        assert!(text.contains("\"data\""), "backup should embed file bytes");
+
+        // Import into an empty database with its own attachments dir
+        // (simulates a fresh machine — the original file is not consulted)
+        let backup: Database = serde_json::from_str(&text).unwrap();
+        let mut db2 = Database::default();
+        let attach2 = dir.join("restored_attachments");
+        let (added, skipped, missing) = merge_backup(&mut db2, &attach2, backup);
+        assert_eq!((added, skipped, missing), (1, 0, 0));
+
+        let restored = &db2.sessions[0].attachments[0];
+        assert!(restored.path.starts_with(&attach2));
+        assert_eq!(fs::read(&restored.path).unwrap(), fs::read(&src_file).unwrap());
+        assert!(restored.data.is_none(), "live DB must not hold base64");
+
+        // Importing the same backup again only skips duplicates
+        let backup_again: Database = serde_json::from_str(&text).unwrap();
+        let (added, skipped, _) = merge_backup(&mut db2, &attach2, backup_again);
+        assert_eq!((added, skipped), (0, 1));
+        assert_eq!(db2.sessions.len(), 1);
+    }
+
+    #[test]
+    fn oversized_attachments_are_not_embedded() {
+        let dir = test_dir("large");
+        let big = dir.join("big.bin");
+        fs::write(&big, vec![7u8; (EMBED_LIMIT_BYTES + 1) as usize]).unwrap();
+        let mut sess = sample_session(1);
+        sess.attachments.push(Attachment {
+            file_name: "big.bin".into(),
+            path: big,
+            data: None,
+        });
+        let db = Database {
+            next_id: 2,
+            lang: Lang::En,
+            sessions: vec![sess],
+        };
+        let (_, too_large) = export_json(&db, &dir).unwrap();
+        assert_eq!(too_large, 1);
+    }
+
+    #[test]
+    fn old_backup_format_still_imports() {
+        // A v0.2-style export: no "lang" on the database, no "data" on the
+        // attachment. The session must import; the attachment file is gone.
+        let json = r#"{
+            "next_id": 2,
+            "sessions": [{
+                "id": 1,
+                "started_at": "2026-05-01T10:00:00Z",
+                "ended_at": "2026-05-01T11:00:00Z",
+                "duration_secs": 3600,
+                "topic": "C",
+                "notes": "",
+                "tags": [],
+                "attachments": [{ "file_name": "gone.c", "path": "/nonexistent/gone.c" }]
+            }]
+        }"#;
+        let backup: Database = serde_json::from_str(json).unwrap();
+        let dir = test_dir("oldfmt");
+        let mut db = Database::default();
+        let (added, skipped, missing) = merge_backup(&mut db, &dir.join("att"), backup);
+        assert_eq!((added, skipped, missing), (1, 0, 1));
+        assert!(db.sessions[0].attachments.is_empty());
+        assert_eq!(db.sessions[0].topic, "C");
+    }
+
+    #[test]
+    fn live_db_never_contains_embedded_bytes() {
+        let mut sess = sample_session(1);
+        sess.attachments.push(Attachment {
+            file_name: "a.c".into(),
+            path: PathBuf::from("/x/a.c"),
+            data: None,
+        });
+        let db = Database {
+            next_id: 2,
+            lang: Lang::Tr,
+            sessions: vec![sess],
+        };
+        let json = serde_json::to_string_pretty(&db).unwrap();
+        assert!(!json.contains("\"data\""));
+    }
+
+    #[test]
+    fn unique_dest_avoids_collisions() {
+        let dir = test_dir("unique");
+        let d1 = unique_dest(&dir, 7, "main.c").unwrap();
+        fs::write(&d1, b"x").unwrap();
+        let d2 = unique_dest(&dir, 7, "main.c").unwrap();
+        assert_ne!(d1, d2);
+        assert!(d2.file_name().unwrap().to_str().unwrap().contains("main_1"));
+    }
+
+    #[test]
+    fn restored_names_are_sanitized() {
+        let dir = test_dir("sanitize");
+        let at = write_attachment_bytes(&dir, 3, "../../evil.c", b"x").unwrap();
+        assert_eq!(at.file_name, "evil.c");
+        assert!(at.path.starts_with(dir.join("3")));
+    }
 }
